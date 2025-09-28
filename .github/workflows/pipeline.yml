@@ -1,0 +1,132 @@
+name: mlops-pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - "**.md"
+      - ".github/ISSUE_TEMPLATE/**"
+  pull_request:
+    branches: [ "main" ]
+  # Nightly retrain (optional)
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC daily
+  workflow_dispatch: {}
+
+# allow workflow to commit/push and create releases
+permissions:
+  contents: write
+
+concurrency:
+  group: mlops-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  ARTIFACT_DIR: artifacts
+  # Optional: pin your dataset and model repos here or via repository secrets
+  HF_MODEL_REPO: ${{ secrets.HF_MODEL_REPO }}
+  HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+
+jobs:
+  build-train-eval-register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # useful CLIs
+          pip install huggingface_hub[cli]
+
+      # ---------- Data preparation ----------
+      - name: Prepare data (load from HF, clean, split)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ env.HF_DATASET_REPO }}
+          ARTIFACT_DIR: ${{ env.ARTIFACT_DIR }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          python -u mlops/prep.py \
+            --dataset_repo "${HF_DATASET_REPO}" \
+            --out_dir "$ARTIFACT_DIR"
+
+      # ---------- Training & tuning ----------
+      - name: Train & tune model
+        run: |
+          python -u mlops/train.py \
+            --train "$ARTIFACT_DIR/train.csv" \
+            --out_dir "$ARTIFACT_DIR"
+
+      # ---------- Evaluation ----------
+      - name: Evaluate on test set
+        run: |
+          python -u mlops/evaluate.py \
+            --test "$ARTIFACT_DIR/test.csv" \
+            --model "$ARTIFACT_DIR/model.joblib" \
+            --out_json "$ARTIFACT_DIR/metrics.json"
+
+      # ---------- Persist build artifacts ----------
+      - name: Upload artifacts (model, params, metrics, logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: ${{ env.ARTIFACT_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      # ---------- Register model on HF Hub ----------
+      - name: Register best model to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODEL_REPO: ${{ env.HF_MODEL_REPO }}
+          ARTIFACT_DIR: ${{ env.ARTIFACT_DIR }}
+        run: |
+          python -u mlops/register.py \
+            --repo_id "$HF_MODEL_REPO" \
+            --folder "$ARTIFACT_DIR"
+
+      # ---------- Commit artifacts back to main (optional but requested) ----------
+      - name: Commit artifacts to repo
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p releases/latest
+          cp -f ${{ env.ARTIFACT_DIR }}/metrics.json releases/latest/
+          cp -f ${{ env.ARTIFACT_DIR }}/best_params.json releases/latest/ || true
+          git add releases/latest
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: update metrics and params [skip ci]"
+            git push origin HEAD:main
+          else
+            echo "No changes to commit."
+          fi
+
+      # ---------- (Optional) Trigger Space rebuild after new model ----------
+      - name: (Optional) Kick Space redeploy
+        if: env.SPACE_ID != ''  # set SPACE_ID as a repo secret to enable
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE_ID: ${{ secrets.SPACE_ID }}
+        run: |
+          printf "Triggering Space rebuild for %s\n" "$SPACE_ID"
+          # a lightweight bump; requires write access to the Space
+          huggingface-cli space restart "$SPACE_ID" --token "$HF_TOKEN"
+
+
